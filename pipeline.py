@@ -30,7 +30,7 @@ def compile_c_to_ll(file_path: Path) -> Optional[Path]:
     Logs to compile_errors.log on failure.
     """
     output_path = file_path.with_suffix(".ll")
-    cmd = ["clang", "-S", "-emit-llvm", "-O0", str(file_path), "-o", str(output_path)]
+    cmd = ["clang", "-S", "-emit-llvm", "-O2", str(file_path), "-o", str(output_path)]
 
     try:
         subprocess.run(

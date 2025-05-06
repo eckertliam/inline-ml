@@ -15,19 +15,34 @@ The following features are extracted:
 - Callee is recursive (bool): whether the caller function is recursive
 - Callee arg count (int): the number of arguments passed to the callee function
 - Callee load store ratio (float): the ratio of loads to stores in the callee function
-- LLVM inlining decision (bool): whether the LLVM optimizer decided to inline the function
+- LLVM inlining decision (bool): whether the LLVM optimizer decided to inline the callee function
 
 Usage:
     poetry run python ir2vec.py
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
+import subprocess
+import pandas as pd
+from typing import Dict, Tuple
 from llvmcpy import LLVMCPy
-
-# TODO: integrate llvm opt inlining decisions into function features and inlining feature vectors
+import yaml
 
 llvm = LLVMCPy()
+
+# we need this to ignore the odd yaml format that llvm opt produces 😥
+class IgnoreUnknownTagsLoader(yaml.SafeLoader):
+    pass
+
+def ignore_unknown(loader, tag_suffix, node):
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node)
+    elif isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node)
+    return loader.construct_scalar(node)
+
+IgnoreUnknownTagsLoader.add_multi_constructor("!", ignore_unknown)
+
 
 class FunctionFeatures:
     """
@@ -47,10 +62,7 @@ class FunctionFeatures:
         load_store_ratio (float): The ratio of loads to stores in the function
     """
 
-    def __init__(
-        self,
-        function_name: str
-    ):
+    def __init__(self, function_name: str):
         self.function_name = function_name
         self.instruction_count: int = 0
         self.total_calls: int = 0
@@ -86,7 +98,7 @@ class InliningFeatureVector:
         callee_is_recursive (bool): Whether the callee makes a recursive call to itself
         callee_arg_count (int): Number of arguments the callee function takes
         callee_load_store_ratio (float): Ratio of load to store instructions in the callee
-        llvm_inlining_decision (bool): Whether the LLVM optimizer decided to inline the function
+        llvm_inlining_decision (bool): Whether the LLVM optimizer decided to inline the callee function
     """
 
     def __init__(self, callee: FunctionFeatures, caller: FunctionFeatures):
@@ -98,7 +110,7 @@ class InliningFeatureVector:
         self.inline_ratio = (
             callee.instruction_count / caller.instruction_count
             if caller.instruction_count != 0
-            else float('inf')
+            else float("inf")
         )
         self.callee_basic_blocks = callee.basic_blocks
         self.caller_basic_blocks = caller.basic_blocks
@@ -106,7 +118,7 @@ class InliningFeatureVector:
         self.callee_is_recursive = callee.is_recursive
         self.callee_arg_count = callee.arg_count
         self.callee_load_store_ratio = callee.load_store_ratio
-        self.llvm_inlining_decision = False # TODO: figure out how to get the LLVM inlining decision
+        self.llvm_inlining_decision = False
 
     def to_dict(self):
         return {
@@ -122,9 +134,15 @@ class InliningFeatureVector:
             "callee_is_recursive": self.callee_is_recursive,
             "callee_arg_count": self.callee_arg_count,
             "callee_load_store_ratio": self.callee_load_store_ratio,
+            "llvm_inlining_decision": self.llvm_inlining_decision,
         }
 
-def analyze_instruction(instr, current_fn_features: FunctionFeatures, features: Dict[str, FunctionFeatures]) -> None:
+
+def analyze_instruction(
+    instr, current_fn_features: FunctionFeatures, features: Dict[str, FunctionFeatures]
+) -> None:
+    # NOTE: for some reason llvmcpy opcodes do not match up to their actual opcodes so I just print the instruction and parse it manually
+    # TODO: add an issue to llvmcpy to fix this
     instr_str = instr.print_value_to_string()
     instr_str = instr_str.decode("utf-8")
     if "call" in instr_str.lower():
@@ -148,10 +166,8 @@ def analyze_instruction(instr, current_fn_features: FunctionFeatures, features: 
         current_fn_features.loads += 1
     elif "store" in instr_str.lower():
         current_fn_features.stores += 1
-    
-        
-        
-                
+
+
 def extract_function_features(module) -> Dict[str, FunctionFeatures]:
     features = {}
     # do a first pass to enter functions into the features dictionary
@@ -160,45 +176,127 @@ def extract_function_features(module) -> Dict[str, FunctionFeatures]:
             continue
         fn_name = function.name.decode("utf-8")
         features[fn_name] = FunctionFeatures(fn_name)
-    
+
     # do a second pass to extract features
     for function in module.iter_functions():
         if function.is_declaration():
             continue
-        
+
         function_features = features[function.name.decode("utf-8")]
 
         for bb in function.iter_basic_blocks():
             function_features.basic_blocks += 1
             for instr in bb.iter_instructions():
                 analyze_instruction(instr, function_features, features)
-                
 
-        function_features.arg_count = 0 # TODO: figure out how to get the arg count
-        function_features.marked_inline = False # TODO: figure out how to get the marked inline attribute
+        function_features.arg_count = 0  # TODO: figure out how to get the arg count
+        function_features.marked_inline = (
+            False  # TODO: figure out how to get the marked inline attribute
+        )
 
     return features
 
 
-def extract_feature_vectors(func_features: Dict[str, FunctionFeatures]) -> List[InliningFeatureVector]:
+def extract_feature_vectors(
+    func_features: Dict[str, FunctionFeatures],
+) -> Dict[Tuple[str, str], InliningFeatureVector]:
     for fn in func_features.values():
         print(fn.function_name, fn.total_calls)
-    vectors = []
+    vectors: Dict[Tuple[str, str], InliningFeatureVector] = {}
     for caller in func_features.values():
         for callee_name in set(caller.calls_in_function):
             if callee_name in func_features:
                 callee = func_features[callee_name]
                 vector = InliningFeatureVector(callee=callee, caller=caller)
-                vectors.append(vector)
+                vectors[(caller.function_name, callee_name)] = vector
     return vectors
 
 
-def mod2vec(module_path: Path) -> List[InliningFeatureVector]:
+def get_llvm_inlining_decision(
+    module_path: Path, output_yaml: Path
+) -> Dict[Tuple[str, str], bool]:
+    cmd = [
+        "opt",
+        f"-passes=inline",
+        f"-inline-threshold=10000",
+        f"-pass-remarks=inline",
+        f"-pass-remarks-output={str(output_yaml)}",
+        "-disable-output",  # we don’t need the resulting IR
+        str(module_path),
+    ]
+
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"opt failed with return code {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
+        )
+
+    if not output_yaml.exists():
+        raise RuntimeError(f"opt did not produce any remarks")
+    
+    
+
+    # Dict[Tuple[callee_name, caller_name], inlining_decision]
+    inlining_decisions: Dict[Tuple[str, str], bool] = {}
+
+    with open(output_yaml, "r") as f:
+        docs = list(yaml.load_all(f, Loader=IgnoreUnknownTagsLoader))
+
+    for entry in docs:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Pass") != "inline":
+            continue
+
+        callee_name = None
+        caller_name = None
+
+        for arg in entry.get("Args", []):
+            if isinstance(arg, dict):
+                if "Callee" in arg:
+                    callee_name = arg["Callee"]
+                if "Caller" in arg:
+                    caller_name = arg["Caller"]
+
+        if callee_name is None or caller_name is None:
+            continue
+
+        was_inlined = entry.get("Name") == "Inlined"
+        inlining_decisions[(callee_name, caller_name)] = was_inlined
+
+    return inlining_decisions
+
+
+def mod2df(module_path: Path) -> pd.DataFrame:
+    """
+    Extracts feature vectors from the LLVM IR and returns a pandas DataFrame.
+
+    Args:
+        module_path (Path): The path to the LLVM IR module
+
+    Returns:
+        pd.DataFrame: A pandas DataFrame containing the feature vectors
+    """
+    inlining_decisions = get_llvm_inlining_decision(
+        module_path, Path("./inlining_decisions.yaml")
+    )
+
     buffer = llvm.create_memory_buffer_with_contents_of_file(str(module_path))  # type: ignore
     context = llvm.get_global_context()  # type: ignore
     module = context.parse_ir(buffer)  # type: ignore
 
     func_features = extract_function_features(module)
-    vectors = extract_feature_vectors(func_features)
-    return vectors
+    vector_dict = extract_feature_vectors(func_features)
 
+    # pass over the vector dict and add the inlining decisions and add inlining decisions to feature vectors
+    for (caller_name, callee_name), vector in vector_dict.items():
+        vector.llvm_inlining_decision = inlining_decisions[(callee_name, caller_name)]
+
+    # convert the vector dict to a dataframe
+    df = pd.DataFrame([vector.to_dict() for vector in vector_dict.values()])
+    return df
