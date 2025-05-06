@@ -11,16 +11,69 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import List, Optional
+from typing import List, Optional, Set
 
-GIT_URL = "https://github.com/DaveGamble/cJSON.git"
+import pandas as pd
+from ir2df import mod2df
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+GIT_URLS = [
+    "https://github.com/DaveGamble/cJSON.git",
+    "https://github.com/madler/zlib.git",
+    "https://github.com/micropython/micropython.git",
+    "https://github.com/jart/cosmopolitan.git",
+    "https://github.com/jart/blink.git",
+    "https://github.com/jart/sectorlisp.git",
+    "https://github.com/ggml-org/llama.cpp.git",
+    "https://github.com/karpathy/llama2.c.git",
+    "https://github.com/woltapp/blurhash.git",
+]
 
 
-def clone_repo(git_url: str, output_dir: str):
+def read_fail_cache(path: Path) -> Set[Path]:
     """
-    Clone the repository from the given URL and save it to the output directory.
+    Read the fail cache from the given path.
     """
-    subprocess.run(["git", "clone", git_url, output_dir])
+    with open(path, "r") as f:
+        return set(Path(line.strip()) for line in f.readlines())
+
+
+def write_fail_cache(path: Path, fail_cache: Set[Path]):
+    """
+    Write the fail cache to the given path.
+    """
+    with open(path, "w") as f:
+        for fail in fail_cache:
+            f.write(str(fail) + "\n")
+
+
+def clone_repo(url: str) -> Optional[Path]:
+    output_dir = Path(url).stem
+    if Path(output_dir).exists():
+        shutil.rmtree(output_dir)
+    result = subprocess.run(
+        ["git", "clone", url, output_dir],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return Path(output_dir) if result.returncode == 0 else None
+
+
+def clone_repos(git_urls: List[str]) -> List[Path]:
+    """
+    Clone the repositories from the given URLs concurrently using ThreadPoolExecutor.
+    """
+    output_dirs = []
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        futures = [executor.submit(clone_repo, url) for url in git_urls]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                output_dirs.append(Path(result))
+
+    return output_dirs
 
 
 def compile_c_to_ll(file_path: Path) -> Optional[Path]:
@@ -53,19 +106,26 @@ def compile_c_to_ll(file_path: Path) -> Optional[Path]:
             return None
 
 
-def rec_compile(dir_path: Path) -> List[Path]:
+def rec_compile(dirs: List[Path], fail_cache: Set[Path] = set()) -> List[Path]:
     """
-    Recursively compile all C files in the given directory to LLVM IR using Path.rglob.
+    Recursively compile all C files in the given directories to LLVM IR using Path.rglob.
     Logs errors to compile_errors.log.
     """
     compiled_files = []
-    for c_file in dir_path.rglob("*.c"):
-        result = compile_c_to_ll(c_file)
-        if result:
-            print(f"Compiled: {result}")
-            compiled_files.append(result)
-        else:
-            print(f"Failed: {c_file}")
+
+    # flatten the list of files to compile
+    c_files = [c_file for dir in dirs for c_file in dir.rglob("*.c")]
+    # filter out files that are in the fail cache
+    c_files = [c_file for c_file in c_files if c_file not in fail_cache]
+
+    # compile the files
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        futures = [executor.submit(compile_c_to_ll, c_file) for c_file in c_files]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                compiled_files.append(result)
+
     return compiled_files
 
 
@@ -78,15 +138,23 @@ def move_files(files: List[Path], output_dir: Path):
         # first move the C file
         # swap the .ll for .c in the name
         c_file = file.with_suffix(".c")
+        if not c_file.exists():
+            print(f"C file does not exist: {c_file}")
+            continue
         shutil.move(c_file, output_dir / "c" / c_file.name)
         # move the .ll file
         shutil.move(file, output_dir / "ll" / file.name)
 
 
-def main():
+def main(keep_compiler_errors: bool = False):
     """
     Main function that orchestrates the pipeline.
     """
+    if Path("fail_cache.txt").exists():
+        fail_cache = read_fail_cache(Path("fail_cache.txt"))
+    else:
+        fail_cache = set()
+
     # if the data directory exists, delete it
     if Path("data").exists():
         shutil.rmtree(Path("data"))
@@ -97,15 +165,39 @@ def main():
 
     # create the data directory
     Path("data").mkdir(parents=True, exist_ok=True)
-    # create the c and ll directories
+    # create the c, ll, and csv directories
     Path("data/c").mkdir(parents=True, exist_ok=True)
     Path("data/ll").mkdir(parents=True, exist_ok=True)
+    Path("data/csv").mkdir(parents=True, exist_ok=True)
 
-    clone_repo(GIT_URL, "cJSON")
-    ll_files = rec_compile(Path("cJSON"))
+    print("Cloning repositories...")
+    dirs: List[Path] = clone_repos(GIT_URLS)
+    # flush the terminal
+    print("Compiling C files to LLVM IR...")
+    ll_files = rec_compile(dirs, fail_cache)
+    # write the fail cache to a file
+    write_fail_cache(Path("fail_cache.txt"), fail_cache)
+    print("Moving files...")
     move_files(ll_files, Path("data"))
-    # clean up the cJSON directory
-    shutil.rmtree(Path("cJSON"))
+    # delete the cloned repos
+    print("Cleaning up...")
+    for dir in dirs:
+        shutil.rmtree(dir)
+
+    if not keep_compiler_errors and Path("compile_errors.log").exists():
+        os.remove(Path("compile_errors.log"))
+
+    # convert the ll files into a list of dataframes and concatenate them
+    print("Collecting callsites from LLVM IR...")
+    df = pd.concat(
+        [mod2df(ll_file) for ll_file in Path("data/ll").glob("*.ll")], ignore_index=True
+    )
+
+    # print the number of callsites extracted
+    print(f"Extracted {len(df)} callsites")
+
+    # write the dataframe to a csv file
+    df.to_csv(Path("data/csv/data.csv"), index=False)
 
 
 if __name__ == "__main__":

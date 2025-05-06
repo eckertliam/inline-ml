@@ -1,7 +1,7 @@
 """
-ir2vec.py
+ir2df.py
 -----------
-This file is responsible for extracting feature vectors from the LLVM IR.
+This file is responsible for extracting feature vectors from the LLVM IR and converting them into a pandas DataFrame.
 The following features are extracted:
 - Callee Function Name (string) - the name of the function being called
 - Caller Function Name (string) - the function which contains the call
@@ -18,7 +18,7 @@ The following features are extracted:
 - LLVM inlining decision (bool): whether the LLVM optimizer decided to inline the callee function
 
 Usage:
-    poetry run python ir2vec.py
+    poetry run python ir2df.py
 """
 
 from pathlib import Path
@@ -30,9 +30,11 @@ import yaml
 
 llvm = LLVMCPy()
 
+
 # we need this to ignore the odd yaml format that llvm opt produces 😥
 class IgnoreUnknownTagsLoader(yaml.SafeLoader):
     pass
+
 
 def ignore_unknown(loader, tag_suffix, node):
     if isinstance(node, yaml.MappingNode):
@@ -40,6 +42,7 @@ def ignore_unknown(loader, tag_suffix, node):
     elif isinstance(node, yaml.SequenceNode):
         return loader.construct_sequence(node)
     return loader.construct_scalar(node)
+
 
 IgnoreUnknownTagsLoader.add_multi_constructor("!", ignore_unknown)
 
@@ -187,6 +190,7 @@ def extract_function_features(module) -> Dict[str, FunctionFeatures]:
         for bb in function.iter_basic_blocks():
             function_features.basic_blocks += 1
             for instr in bb.iter_instructions():
+                function_features.instruction_count += 1
                 analyze_instruction(instr, function_features, features)
 
         function_features.arg_count = 0  # TODO: figure out how to get the arg count
@@ -200,8 +204,6 @@ def extract_function_features(module) -> Dict[str, FunctionFeatures]:
 def extract_feature_vectors(
     func_features: Dict[str, FunctionFeatures],
 ) -> Dict[Tuple[str, str], InliningFeatureVector]:
-    for fn in func_features.values():
-        print(fn.function_name, fn.total_calls)
     vectors: Dict[Tuple[str, str], InliningFeatureVector] = {}
     for caller in func_features.values():
         for callee_name in set(caller.calls_in_function):
@@ -238,8 +240,6 @@ def get_llvm_inlining_decision(
 
     if not output_yaml.exists():
         raise RuntimeError(f"opt did not produce any remarks")
-    
-    
 
     # Dict[Tuple[callee_name, caller_name], inlining_decision]
     inlining_decisions: Dict[Tuple[str, str], bool] = {}
@@ -248,14 +248,18 @@ def get_llvm_inlining_decision(
         docs = list(yaml.load_all(f, Loader=IgnoreUnknownTagsLoader))
 
     for entry in docs:
-        if not isinstance(entry, dict):
-            continue
+        # just a guard, don't expect this to throw
+        assert isinstance(entry, dict), f"entry is not a dict: {entry}"
+
+        # skip if the pass is not inline
         if entry.get("Pass") != "inline":
             continue
 
+        # prepare the callee and caller names
         callee_name = None
         caller_name = None
 
+        # iterate over the arguments and extract the callee and caller names
         for arg in entry.get("Args", []):
             if isinstance(arg, dict):
                 if "Callee" in arg:
@@ -263,11 +267,16 @@ def get_llvm_inlining_decision(
                 if "Caller" in arg:
                     caller_name = arg["Caller"]
 
-        if callee_name is None or caller_name is None:
-            continue
+        # guard against missing callee or caller names
+        assert callee_name is not None, f"callee name is None: {entry}"
+        assert caller_name is not None, f"caller name is None: {entry}"
 
+        # extract the inlining decision
         was_inlined = entry.get("Name") == "Inlined"
         inlining_decisions[(callee_name, caller_name)] = was_inlined
+
+    # delete the output yaml file
+    output_yaml.unlink()
 
     return inlining_decisions
 

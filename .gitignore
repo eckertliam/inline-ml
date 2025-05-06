@@ -177,3 +177,4 @@ data/
 *.json
 *.ll
 *.c
+fail_cache.txt
