@@ -11,10 +11,17 @@ python = "^3.12"
 llvmcpy = "^0.2.0"
 pyyaml = "^6.0.2"
 pandas = "^2.2.3"
+xgboost = "^3.0.0"
+scikit-learn = "^1.6.1"
+matplotlib = "^3.10.1"
+seaborn = "^0.13.2"
+shap = "^0.47.2"
 
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"
+notebook = "^7.4.2"
+ipykernel = "^6.29.5"
 
 [build-system]
 requires = ["poetry-core"]
