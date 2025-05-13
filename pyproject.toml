@@ -16,6 +16,7 @@ scikit-learn = "^1.6.1"
 matplotlib = "^3.10.1"
 seaborn = "^0.13.2"
 shap = "^0.47.2"
+dearpygui = "^2.0.0"
 
 
 [tool.poetry.group.dev.dependencies]

@@ -2,6 +2,7 @@
 pipeline.py
 -----------
 This file is responsible for pulling, processing, and storing the training data.
+Some of the functions are also used in dashboard.py to compile the user's C code to LLVM IR and extract the callsites.
 
 Usage:
     poetry run python pipeline.py
@@ -52,7 +53,7 @@ def clone_repo(url: str) -> Optional[Path]:
     if Path(output_dir).exists():
         shutil.rmtree(output_dir)
     result = subprocess.run(
-        ["git", "clone", url, output_dir],
+        ["git", "clone", "--depth", "1", url, output_dir],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -76,37 +77,29 @@ def clone_repos(git_urls: List[str]) -> List[Path]:
     return output_dirs
 
 
-def compile_c_to_ll(file_path: Path) -> Optional[Path]:
+def compile_c_to_ll(file_path: Path, fail_cache: Optional[Set[Path]] = None) -> Optional[Path]:
     """
     Compile the given C file to LLVM IR and return the path to the output file.
     Retries with -I. if compilation fails the first time.
     Logs to compile_errors.log on failure.
     """
     output_path = file_path.with_suffix(".ll")
-    cmd = ["clang", "-S", "-emit-llvm", "-O2", str(file_path), "-o", str(output_path)]
+    cmd = ["clang", "-S", "-emit-llvm", "-O2", "-I.", str(file_path), "-o", str(output_path)]
 
     try:
         subprocess.run(
-            cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
         return output_path
-    except subprocess.CalledProcessError:
-        cmd_with_include = cmd[:-2] + ["-I."] + cmd[-2:]
-        try:
-            subprocess.run(
-                cmd_with_include,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return output_path
-        except subprocess.CalledProcessError:
-            with open("compile_errors.log", "a") as log_file:
-                log_file.write(f"Failed to compile {file_path} with -I.\n")
-            return None
+    except subprocess.CalledProcessError as e:
+        with open("compile_errors.log", "a") as f:
+            f.write(f"Failed to compile {file_path}\n")
+            f.write(e.stderr.decode(errors="replace") + "\n")
+        if fail_cache:
+            fail_cache.add(file_path)
+        return None
 
-
-def rec_compile(dirs: List[Path], fail_cache: Set[Path] = set()) -> List[Path]:
+def rec_compile(dirs: List[Path], fail_cache: Optional[Set[Path]] = None) -> List[Path]:
     """
     Recursively compile all C files in the given directories to LLVM IR using Path.rglob.
     Logs errors to compile_errors.log.
@@ -115,12 +108,14 @@ def rec_compile(dirs: List[Path], fail_cache: Set[Path] = set()) -> List[Path]:
 
     # flatten the list of files to compile
     c_files = [c_file for dir in dirs for c_file in dir.rglob("*.c")]
-    # filter out files that are in the fail cache
-    c_files = [c_file for c_file in c_files if c_file not in fail_cache]
-
+    
+    if fail_cache:
+        # filter out files that are in the fail cache
+        c_files = [c_file for c_file in c_files if c_file not in fail_cache]
+        
     # compile the files
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
-        futures = [executor.submit(compile_c_to_ll, c_file) for c_file in c_files]
+        futures = [executor.submit(compile_c_to_ll, c_file, fail_cache) for c_file in c_files]
         for future in as_completed(futures):
             result = future.result()
             if result:
@@ -195,6 +190,9 @@ def main(keep_compiler_errors: bool = False):
 
     # print the number of callsites extracted
     print(f"Extracted {len(df)} callsites")
+    
+    # print the ratio of inlining decisions
+    print(f"Ratio of inlining decisions: {df['llvm_inlining_decision'].mean()}")
 
     # write the dataframe to a csv file
     df.to_csv(Path("data/csv/data.csv"), index=False)

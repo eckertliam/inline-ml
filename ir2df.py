@@ -11,7 +11,6 @@ The following features are extracted:
 - Inline Ratio (float): callee size / caller size
 - Callee basic blocks (int): the number of basic blocks in the callee function
 - Caller basic blocks (int): the number of basic blocks in the caller function
-- Callee is marked inline (bool): whether the callee function is marked inline
 - Callee is recursive (bool): whether the caller function is recursive
 - Callee arg count (int): the number of arguments passed to the callee function
 - Callee load store ratio (float): the ratio of loads to stores in the callee function
@@ -31,7 +30,7 @@ import yaml
 llvm = LLVMCPy()
 
 
-# we need this to ignore the odd yaml format that llvm opt produces 😥
+# we need this to ignore the odd yaml format that llvm opt produces
 class IgnoreUnknownTagsLoader(yaml.SafeLoader):
     pass
 
@@ -58,7 +57,6 @@ class FunctionFeatures:
         calls_in_function (list[str]): The names of the functions that are called within the function
         basic_blocks (int): The number of basic blocks in the function
         is_recursive (bool): Whether the function is recursive
-        marked_inline (bool): Whether the function is marked inline
         arg_count (int): The number of arguments passed to the function
         loads (int): The number of loads in the function
         stores (int): The number of stores in the function
@@ -72,7 +70,6 @@ class FunctionFeatures:
         self.calls_in_function: list[str] = []
         self.basic_blocks: int = 0
         self.is_recursive: bool = False
-        self.marked_inline: bool = False
         self.arg_count: int = 0
         self.loads: int = 0
         self.stores: int = 0
@@ -97,7 +94,6 @@ class InliningFeatureVector:
         inline_ratio (float): Ratio of callee instruction count to caller instruction count
         callee_basic_blocks (int): Number of basic blocks in the callee function
         caller_basic_blocks (int): Number of basic blocks in the caller function
-        callee_marked_inline (bool): Whether the callee is explicitly marked with the 'alwaysinline' attribute
         callee_is_recursive (bool): Whether the callee makes a recursive call to itself
         callee_arg_count (int): Number of arguments the callee function takes
         callee_load_store_ratio (float): Ratio of load to store instructions in the callee
@@ -117,7 +113,6 @@ class InliningFeatureVector:
         )
         self.callee_basic_blocks = callee.basic_blocks
         self.caller_basic_blocks = caller.basic_blocks
-        self.callee_marked_inline = callee.marked_inline
         self.callee_is_recursive = callee.is_recursive
         self.callee_arg_count = callee.arg_count
         self.callee_load_store_ratio = callee.load_store_ratio
@@ -133,7 +128,6 @@ class InliningFeatureVector:
             "inline_ratio": self.inline_ratio,
             "callee_basic_blocks": self.callee_basic_blocks,
             "caller_basic_blocks": self.caller_basic_blocks,
-            "callee_marked_inline": self.callee_marked_inline,
             "callee_is_recursive": self.callee_is_recursive,
             "callee_arg_count": self.callee_arg_count,
             "callee_load_store_ratio": self.callee_load_store_ratio,
@@ -145,7 +139,6 @@ def analyze_instruction(
     instr, current_fn_features: FunctionFeatures, features: Dict[str, FunctionFeatures]
 ) -> None:
     # NOTE: for some reason llvmcpy opcodes do not match up to their actual opcodes so I just print the instruction and parse it manually
-    # TODO: add an issue to llvmcpy to fix this
     instr_str = instr.print_value_to_string()
     instr_str = instr_str.decode("utf-8")
     if "call" in instr_str.lower():
@@ -161,6 +154,8 @@ def analyze_instruction(
             # check if the called function is in the features dictionary
             if fn_name in features:
                 features[fn_name].total_calls += 1
+            elif fn_name == current_fn_features.function_name:
+                current_fn_features.is_recursive = True
         else:
             # this means its a call to an external function
             # we need to count the number of function calls so we just add "external" to the calls_in_function list
@@ -193,10 +188,8 @@ def extract_function_features(module) -> Dict[str, FunctionFeatures]:
                 function_features.instruction_count += 1
                 analyze_instruction(instr, function_features, features)
 
-        function_features.arg_count = 0  # TODO: figure out how to get the arg count
-        function_features.marked_inline = (
-            False  # TODO: figure out how to get the marked inline attribute
-        )
+        function_features.arg_count = function.count_params()
+
 
     return features
 
