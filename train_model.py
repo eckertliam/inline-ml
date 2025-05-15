@@ -3,7 +3,6 @@ import pandas as pd
 from xgboost import XGBClassifier
 from sklearn.model_selection import RandomizedSearchCV, train_test_split
 from sklearn.metrics import classification_report
-from sklearn.model_selection import cross_val_score
 
 TRAINING_FEATURES = [
     "callee_instruction_count",
@@ -38,7 +37,7 @@ def prep_data(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
 
 if __name__ == "__main__":
 
-    data = pd.read_csv("data/csv/data.csv")
+    data = pd.read_csv("data/data.csv")
 
     x, y = prep_data(data)
 

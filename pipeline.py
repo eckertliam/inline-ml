@@ -15,6 +15,7 @@ import subprocess
 from typing import List, Optional, Set
 
 import pandas as pd
+from dashboard_utils import check_llvm_tools
 from ir2df import mod2df
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -77,74 +78,69 @@ def clone_repos(git_urls: List[str]) -> List[Path]:
     return output_dirs
 
 
-def compile_c_to_ll(file_path: Path, fail_cache: Optional[Set[Path]] = None) -> Optional[Path]:
+def compile_c_to_ll(
+    file_path: Path, fail_cache: Optional[Set[Path]] = None
+) -> Optional[str]:
     """
-    Compile the given C file to LLVM IR and return the path to the output file.
-    Retries with -I. if compilation fails the first time.
-    Logs to compile_errors.log on failure.
+    Compile the C file to LLVM IR using clang.
+    Returns the LLVM IR as a string.
     """
-    output_path = file_path.with_suffix(".ll")
-    cmd = ["clang", "-S", "-emit-llvm", "-O2", "-I.", str(file_path), "-o", str(output_path)]
+    cmd = ["clang", "-S", "-emit-llvm", "-O2", "-I.", str(file_path), "-o", "-"]
 
     try:
-        subprocess.run(
-            cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        # run the command and capture the output
+        result = subprocess.run(
+            cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        return output_path
+        # decode the output llvm ir
+        return result.stdout.decode(errors="replace")
     except subprocess.CalledProcessError as e:
+        # log the error to the compile_errors.log file
         with open("compile_errors.log", "a") as f:
             f.write(f"Failed to compile {file_path}\n")
+            # log the error message
             f.write(e.stderr.decode(errors="replace") + "\n")
         if fail_cache:
+            # add the file to the fail cache
             fail_cache.add(file_path)
         return None
 
-def rec_compile(dirs: List[Path], fail_cache: Optional[Set[Path]] = None) -> List[Path]:
+
+def rec_compile(dirs: List[Path], fail_cache: Optional[Set[Path]] = None) -> List[str]:
     """
     Recursively compile all C files in the given directories to LLVM IR using Path.rglob.
     Logs errors to compile_errors.log.
+    Returns a list of LLVM IR strings.
     """
-    compiled_files = []
+    ir_strings = []
 
     # flatten the list of files to compile
     c_files = [c_file for dir in dirs for c_file in dir.rglob("*.c")]
-    
+
     if fail_cache:
         # filter out files that are in the fail cache
         c_files = [c_file for c_file in c_files if c_file not in fail_cache]
-        
+
     # compile the files
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
-        futures = [executor.submit(compile_c_to_ll, c_file, fail_cache) for c_file in c_files]
+        futures = [
+            executor.submit(compile_c_to_ll, c_file, fail_cache) for c_file in c_files
+        ]
         for future in as_completed(futures):
             result = future.result()
             if result:
-                compiled_files.append(result)
+                ir_strings.append(result)
 
-    return compiled_files
-
-
-def move_files(files: List[Path], output_dir: Path):
-    """
-    Move the C files and their compiled LLVM IR outputs to the data directory
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for file in files:
-        # first move the C file
-        # swap the .ll for .c in the name
-        c_file = file.with_suffix(".c")
-        if not c_file.exists():
-            print(f"C file does not exist: {c_file}")
-            continue
-        shutil.move(c_file, output_dir / "c" / c_file.name)
-        # move the .ll file
-        shutil.move(file, output_dir / "ll" / file.name)
+    return ir_strings
 
 
 def main(keep_compiler_errors: bool = False):
     """
     Main function that orchestrates the pipeline.
     """
+    # check if the required LLVM tools are in the PATH
+    check_llvm_tools()
+
     if Path("fail_cache.txt").exists():
         fail_cache = read_fail_cache(Path("fail_cache.txt"))
     else:
@@ -160,20 +156,14 @@ def main(keep_compiler_errors: bool = False):
 
     # create the data directory
     Path("data").mkdir(parents=True, exist_ok=True)
-    # create the c, ll, and csv directories
-    Path("data/c").mkdir(parents=True, exist_ok=True)
-    Path("data/ll").mkdir(parents=True, exist_ok=True)
-    Path("data/csv").mkdir(parents=True, exist_ok=True)
 
     print("Cloning repositories...")
     dirs: List[Path] = clone_repos(GIT_URLS)
     # flush the terminal
     print("Compiling C files to LLVM IR...")
-    ll_files = rec_compile(dirs, fail_cache)
+    ir_strings: List[str] = rec_compile(dirs, fail_cache)
     # write the fail cache to a file
     write_fail_cache(Path("fail_cache.txt"), fail_cache)
-    print("Moving files...")
-    move_files(ll_files, Path("data"))
     # delete the cloned repos
     print("Cleaning up...")
     for dir in dirs:
@@ -184,18 +174,16 @@ def main(keep_compiler_errors: bool = False):
 
     # convert the ll files into a list of dataframes and concatenate them
     print("Collecting callsites from LLVM IR...")
-    df = pd.concat(
-        [mod2df(ll_file) for ll_file in Path("data/ll").glob("*.ll")], ignore_index=True
-    )
+    df = pd.concat([mod2df(ir_string) for ir_string in ir_strings], ignore_index=True)
 
     # print the number of callsites extracted
     print(f"Extracted {len(df)} callsites")
-    
+
     # print the ratio of inlining decisions
     print(f"Ratio of inlining decisions: {df['llvm_inlining_decision'].mean()}")
 
     # write the dataframe to a csv file
-    df.to_csv(Path("data/csv/data.csv"), index=False)
+    df.to_csv(Path("data/data.csv"), index=False)
 
 
 if __name__ == "__main__":

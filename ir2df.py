@@ -22,6 +22,7 @@ Usage:
 
 from pathlib import Path
 import subprocess
+import tempfile
 import pandas as pd
 from typing import Dict, Tuple
 from llvmcpy import LLVMCPy
@@ -190,7 +191,6 @@ def extract_function_features(module) -> Dict[str, FunctionFeatures]:
 
         function_features.arg_count = function.count_params()
 
-
     return features
 
 
@@ -207,9 +207,11 @@ def extract_feature_vectors(
     return vectors
 
 
-def get_llvm_inlining_decision(
-    module_path: Path, output_yaml: Path
-) -> Dict[Tuple[str, str], bool]:
+def get_llvm_inlining_decision(module_path: Path) -> Dict[Tuple[str, str], bool]:
+    # create a temporary file to store the output
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml") as temp_file:
+        output_yaml = Path(temp_file.name)
+
     cmd = [
         "opt",
         f"-passes=inline",
@@ -230,9 +232,6 @@ def get_llvm_inlining_decision(
             f"STDOUT:\n{result.stdout}\n"
             f"STDERR:\n{result.stderr}"
         )
-
-    if not output_yaml.exists():
-        raise RuntimeError(f"opt did not produce any remarks")
 
     # Dict[Tuple[callee_name, caller_name], inlining_decision]
     inlining_decisions: Dict[Tuple[str, str], bool] = {}
@@ -274,19 +273,22 @@ def get_llvm_inlining_decision(
     return inlining_decisions
 
 
-def mod2df(module_path: Path) -> pd.DataFrame:
+def mod2df(module_str: str) -> pd.DataFrame:
     """
-    Extracts feature vectors from the LLVM IR and returns a pandas DataFrame.
+    Extracts feature vectors from a string of LLVM IR and returns a pandas DataFrame.
 
     Args:
-        module_path (Path): The path to the LLVM IR module
+        module_str (str): The LLVM IR module as a string
 
     Returns:
         pd.DataFrame: A pandas DataFrame containing the feature vectors
     """
-    inlining_decisions = get_llvm_inlining_decision(
-        module_path, Path("./inlining_decisions.yaml")
-    )
+    # create a temporary file to store the module
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ll") as temp_file:
+        temp_file.write(module_str.encode("utf-8"))
+        module_path = Path(temp_file.name)
+
+    inlining_decisions = get_llvm_inlining_decision(module_path)
 
     buffer = llvm.create_memory_buffer_with_contents_of_file(str(module_path))  # type: ignore
     context = llvm.get_global_context()  # type: ignore
@@ -294,6 +296,9 @@ def mod2df(module_path: Path) -> pd.DataFrame:
 
     func_features = extract_function_features(module)
     vector_dict = extract_feature_vectors(func_features)
+
+    # delete the temporary file
+    module_path.unlink()
 
     # pass over the vector dict and add the inlining decisions and add inlining decisions to feature vectors
     for (caller_name, callee_name), vector in vector_dict.items():
