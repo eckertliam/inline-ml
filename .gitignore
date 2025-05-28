@@ -179,4 +179,4 @@ data/
 *.c
 fail_cache.txt
 inline_model.json
-package_project.py
+.DS_Store

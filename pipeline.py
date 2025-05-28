@@ -12,10 +12,10 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 from typing import List, Optional, Set
 
 import pandas as pd
-from dashboard_utils import check_llvm_tools
 from ir2df import mod2df
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,47 +31,63 @@ GIT_URLS = [
     "https://github.com/woltapp/blurhash.git",
 ]
 
+def check_llvm_tools():
+    for tool in ["opt", "clang"]:
+        if not shutil.which(tool):
+            raise RuntimeError(
+                f"Required LLVM tool {tool} not found in PATH.\n"
+                f"This tool is required to run this program.\n"
+                f"Please follow the user guide to install the required tools."
+            )
+
 
 def read_fail_cache(path: Path) -> Set[Path]:
-    """
-    Read the fail cache from the given path.
-    """
+    # read the fail cache from a file
     with open(path, "r") as f:
         return set(Path(line.strip()) for line in f.readlines())
 
 
 def write_fail_cache(path: Path, fail_cache: Set[Path]):
-    """
-    Write the fail cache to the given path.
-    """
+    # write the fail cache to a file
     with open(path, "w") as f:
         for fail in fail_cache:
             f.write(str(fail) + "\n")
 
 
 def clone_repo(url: str) -> Optional[Path]:
+    # set the output to the name of the repo
     output_dir = Path(url).stem
+    # if the directory exists, delete it
     if Path(output_dir).exists():
         shutil.rmtree(output_dir)
+    # clone the repo
     result = subprocess.run(
         ["git", "clone", "--depth", "1", url, output_dir],
         check=True,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
-    return Path(output_dir) if result.returncode == 0 else None
+    # check if the repo was cloned successfully
+    if result.returncode != 0:
+        # log the error to the terminal
+        print(f"Failed to clone {url}: {result.stderr.decode(errors='replace')}")
+        # return None
+        return None
+    else:
+        # return the path to the repo
+        return Path(output_dir)
 
 
 def clone_repos(git_urls: List[str]) -> List[Path]:
-    """
-    Clone the repositories from the given URLs concurrently using ThreadPoolExecutor.
-    """
+    # lists paths to the cloned repos
     output_dirs = []
-
+    # clone the repos concurrently
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
         futures = [executor.submit(clone_repo, url) for url in git_urls]
+        # wait for the repos to be cloned
         for future in as_completed(futures):
             result = future.result()
+            # if the repo was cloned successfully, add the path to the list
             if result:
                 output_dirs.append(Path(result))
 
@@ -79,20 +95,17 @@ def clone_repos(git_urls: List[str]) -> List[Path]:
 
 
 def compile_c_to_ll(
-    file_path: Path, fail_cache: Optional[Set[Path]] = None
+    file_path: Path, fail_cache: Optional[Set[Path]] = None, fail_cache_lock: Optional[threading.Lock] = None
 ) -> Optional[str]:
-    """
-    Compile the C file to LLVM IR using clang.
-    Returns the LLVM IR as a string.
-    """
+    # compile c to llvm ir using clang
     cmd = ["clang", "-S", "-emit-llvm", "-O2", "-I.", str(file_path), "-o", "-"]
-
+    # try to run the command
     try:
         # run the command and capture the output
         result = subprocess.run(
             cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        # decode the output llvm ir
+        # return the llvm ir
         return result.stdout.decode(errors="replace")
     except subprocess.CalledProcessError as e:
         # log the error to the compile_errors.log file
@@ -100,44 +113,41 @@ def compile_c_to_ll(
             f.write(f"Failed to compile {file_path}\n")
             # log the error message
             f.write(e.stderr.decode(errors="replace") + "\n")
-        if fail_cache:
-            # add the file to the fail cache
-            fail_cache.add(file_path)
+        if fail_cache is not None and fail_cache_lock is not None:
+            # add the file to the fail cache with a lock
+            with fail_cache_lock:
+                fail_cache.add(file_path)
         return None
 
 
 def rec_compile(dirs: List[Path], fail_cache: Optional[Set[Path]] = None) -> List[str]:
-    """
-    Recursively compile all C files in the given directories to LLVM IR using Path.rglob.
-    Logs errors to compile_errors.log.
-    Returns a list of LLVM IR strings.
-    """
+    # list to store the llvm ir
     ir_strings = []
 
     # flatten the list of files to compile
     c_files = [c_file for dir in dirs for c_file in dir.rglob("*.c")]
 
-    if fail_cache:
-        # filter out files that are in the fail cache
+    # if the fail cache exists, filter out files that are in the fail cache
+    if fail_cache is not None:
         c_files = [c_file for c_file in c_files if c_file not in fail_cache]
+        fail_cache_lock = threading.Lock()
+    else:
+        fail_cache_lock = None
 
-    # compile the files
+    # compile the files concurrently
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
         futures = [
-            executor.submit(compile_c_to_ll, c_file, fail_cache) for c_file in c_files
+            executor.submit(compile_c_to_ll, c_file, fail_cache, fail_cache_lock) for c_file in c_files
         ]
         for future in as_completed(futures):
             result = future.result()
-            if result:
+            if result:  # add successful runs to the list
                 ir_strings.append(result)
 
     return ir_strings
 
 
 def main(keep_compiler_errors: bool = False):
-    """
-    Main function that orchestrates the pipeline.
-    """
     # check if the required LLVM tools are in the PATH
     check_llvm_tools()
 

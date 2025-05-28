@@ -14,15 +14,6 @@ TRAINING_FEATURES = [
 
 
 def prep_data(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    """Preprocess the data to train the model on
-    Convert bools to ints, drop columns we filtered during feature selection.
-
-    Args:
-        data (pd.DataFrame): The data to preprocess.
-
-    Returns:
-        Tuple[pd.DataFrame, pd.Series]: The preprocessed x and y data.
-    """
     # keep only the target (llvm_inlining_decision) and training features
     filtered_df = data[["llvm_inlining_decision"] + TRAINING_FEATURES]
     # drop NaNs
